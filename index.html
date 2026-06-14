@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-<title>SeanFPS v0.8.1</title>
+<title>SeanFPS v0.9.1</title>
 <style>
   :root {
     --panel: rgba(0,0,0,.45);
@@ -215,6 +215,26 @@
   }
   #strafeL { left: 62px; bottom: 88px; }
   #strafeR { left: 112px; bottom: 88px; }
+  #debugToggle, #calibrateToggle {
+    position: fixed;
+    bottom: calc(12px + env(safe-area-inset-bottom));
+    width: 44px;
+    height: 34px;
+    border-radius: 10px;
+    border: 1px solid rgba(255,255,255,.22);
+    background: rgba(0,0,0,.35);
+    color: rgba(255,255,255,.82);
+    font-weight: 900;
+    font-size: 11px;
+    pointer-events: auto;
+    z-index: 4;
+  }
+  #debugToggle {
+    right: calc(12px + env(safe-area-inset-right));
+  }
+  #calibrateToggle {
+    right: calc(62px + env(safe-area-inset-right));
+  }
   #mapMini {
     position: fixed;
     right: calc(12px + env(safe-area-inset-right));
@@ -231,13 +251,19 @@
   /* Hide touch controls only on devices that clearly have mouse/trackpad-style input.
      This keeps touch controls visible on iPad landscape. */
   @media (pointer: fine) and (hover: hover) {
-    #touchLayer { display:none; }
+    #touchLayer,
+    #debugToggle,
+    #calibrateToggle {
+      display:none;
+    }
   }
 </style>
 </head>
 <body>
 <canvas id="game"></canvas>
 <canvas id="mapMini"></canvas>
+<button id="calibrateToggle" type="button">CAL</button>
+<button id="debugToggle" type="button">PAD</button>
 
 <div id="hud">
   <div id="bars">
@@ -255,11 +281,11 @@
 <div id="toast"></div>
 
 <div id="message">
-  <h1 id="messageTitle">SeanFPS v0.8.1</h1>
+  <h1 id="messageTitle">SeanFPS v0.9.1</h1>
   <div id="messageBody">
     <p><b>Goal:</b> destroy all zombies.</p>
     <p><b>iPhone:</b> use touch buttons or a Bluetooth controller. Tap once to start.</p>
-    <p><b>Controller:</b> D-pad/left stick moves/turns. A = shoot. B = open/use. Shoulder buttons may strafe.</p>
+    <p><b>Controller:</b> D-pad/left stick moves/turns. A = shoot. B = open/use. If turning is wrong, tap CAL to learn your controller.</p>
     <p><b>Keyboard:</b> WASD/Arrows, Q/E strafe, Space = shoot, F/Z = open.</p>
     <small>Old-school raycaster controls: turn and move, not modern mouse-look. iOS may show “Controller: press a button” until you press a physical controller button.</small>
   </div>
@@ -294,6 +320,8 @@
   const enemyCountEl = document.getElementById("enemyCount");
   const ammoTextEl = document.getElementById("ammoText");
   const controllerTextEl = document.getElementById("controllerText");
+  const calibrateToggle = document.getElementById("calibrateToggle");
+  const debugToggle = document.getElementById("debugToggle");
   const padDebugLineEl = document.getElementById("padDebugLine");
   const padDebugTextEl = document.getElementById("padDebugText");
   const hpFill = document.getElementById("hpFill");
@@ -468,6 +496,26 @@
   let lastPadDebug = "";
   let showPadDebug = false;
 
+  const controllerMapKey = "seanfps-controller-map-v2";
+  const calibrationSteps = [
+    { action: "right", label: "RIGHT", kind: "turn", value: 1 },
+    { action: "left", label: "LEFT", kind: "turn", value: -1 },
+    { action: "forward", label: "UP / FORWARD", kind: "move", value: 1 },
+    { action: "back", label: "DOWN / BACK", kind: "move", value: -1 },
+    { action: "shoot", label: "SHOOT / A", kind: "action" },
+    { action: "open", label: "OPEN / B", kind: "action" },
+    { action: "strafeLeft", label: "STRAFE LEFT / L", kind: "optional" },
+    { action: "strafeRight", label: "STRAFE RIGHT / R", kind: "optional" }
+  ];
+
+  let controllerMap = loadControllerMap();
+  let calibration = {
+    active: false,
+    step: 0,
+    waitingForRelease: true,
+    lastRecordedAt: 0
+  };
+
   function initAudio() {
     if (!audioCtx) {
       const AC = window.AudioContext || window.webkitAudioContext;
@@ -510,8 +558,268 @@
     message.style.display = "block";
   }
 
+  function loadControllerMap() {
+    try {
+      const raw = window.localStorage ? localStorage.getItem(controllerMapKey) : "";
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveControllerMap() {
+    try {
+      if (window.localStorage) localStorage.setItem(controllerMapKey, JSON.stringify(controllerMap));
+    } catch {
+      // Local storage may be blocked in some browser contexts. The map still works for this session.
+    }
+  }
+
+  function hasMovementMap() {
+    return !!(controllerMap.right && controllerMap.left && controllerMap.forward && controllerMap.back);
+  }
+
+  function bindingLabel(binding) {
+    if (!binding) return "not set";
+    if (binding.type === "button") return `button ${binding.index}`;
+    if (binding.type === "axis") return `axis ${binding.index} ${binding.sign > 0 ? "+" : "-"}`;
+    if (binding.type === "hat") return `hat ${binding.index} ${binding.name}`;
+    return "unknown";
+  }
+
+  function showCalibrationPrompt(extra = "") {
+    const step = calibrationSteps[calibration.step];
+    messageTitle.textContent = "Controller Setup";
+    messageBody.textContent = "";
+
+    const p1 = document.createElement("p");
+    p1.textContent = step
+      ? `Step ${calibration.step + 1}/${calibrationSteps.length}: press ${step.label}.`
+      : "Controller setup complete.";
+    messageBody.appendChild(p1);
+
+    const p2 = document.createElement("p");
+    p2.textContent = extra || "Release all controller buttons first, then press the requested control once.";
+    messageBody.appendChild(p2);
+
+    const p3 = document.createElement("p");
+    p3.textContent = "Calibration uses digital/D-pad style input for reliability on compact controllers.";
+    messageBody.appendChild(p3);
+
+    const p4 = document.createElement("p");
+    p4.textContent = "If you do not have that button, tap CAL again or press C to restart setup later.";
+    messageBody.appendChild(p4);
+
+    restartBtn.style.display = "none";
+    message.style.display = "block";
+  }
+
+  function startControllerCalibration() {
+    controllerMap = {};
+    calibration.active = true;
+    calibration.step = 0;
+    calibration.waitingForRelease = true;
+    calibration.lastRecordedAt = performance.now();
+    started = false;
+
+    showPadDebug = true;
+    padDebugLineEl.classList.add("visible");
+    showCalibrationPrompt("Release all controller buttons, then press RIGHT.");
+    showToast("Controller setup started", 0.7);
+  }
+
+  function finishControllerCalibration() {
+    calibration.active = false;
+    saveControllerMap();
+    started = false;
+
+    messageTitle.textContent = "Controller Saved";
+    messageBody.textContent = "";
+
+    const lines = [
+      "Your controller mapping is now saved on this device.",
+      "Calibrated movement is digital/D-pad style for reliable 8BitDo Micro input.",
+      `RIGHT = ${bindingLabel(controllerMap.right)}, LEFT = ${bindingLabel(controllerMap.left)}`,
+      `FORWARD = ${bindingLabel(controllerMap.forward)}, BACK = ${bindingLabel(controllerMap.back)}`,
+      `SHOOT = ${bindingLabel(controllerMap.shoot)}, OPEN = ${bindingLabel(controllerMap.open)}`,
+      "Tap the game screen to play."
+    ];
+
+    for (const line of lines) {
+      const p = document.createElement("p");
+      p.textContent = line;
+      messageBody.appendChild(p);
+    }
+
+    restartBtn.style.display = "none";
+    message.style.display = "block";
+    showToast("Controller saved", 0.75);
+  }
+
+  function signalIsActive(binding, p) {
+    if (!binding || !p) return false;
+    const b = p.buttons || [];
+    const axes = p.axes || [];
+
+    if (binding.type === "button") {
+      return !!(b[binding.index] && b[binding.index].pressed);
+    }
+
+    if (binding.type === "axis") {
+      const value = axes[binding.index] || 0;
+      return Math.abs(value) > 0.35 && Math.sign(value) === binding.sign;
+    }
+
+    if (binding.type === "hat") {
+      const decoded = decodeHatAxis(axes[binding.index]);
+      return !!decoded && decoded.name === binding.name;
+    }
+
+    return false;
+  }
+
+  function getControllerSignals(p) {
+    if (!p) return [];
+
+    const signals = [];
+    const b = p.buttons || [];
+    const axes = p.axes || [];
+
+    for (let i = 0; i < b.length; i++) {
+      if (b[i] && b[i].pressed) {
+        signals.push({ type: "button", index: i, strength: 1, label: `B${i}` });
+      }
+    }
+
+    for (let i = 0; i < axes.length; i++) {
+      const value = axes[i] || 0;
+      const hat = decodeHatAxis(value);
+      if (hat) {
+        signals.push({
+          type: "hat",
+          index: i,
+          name: hat.name,
+          move: hat.move,
+          turn: hat.turn,
+          strength: 1,
+          label: `H${i}:${hat.name}`
+        });
+      } else if (Math.abs(value) > 0.35) {
+        signals.push({
+          type: "axis",
+          index: i,
+          sign: Math.sign(value),
+          strength: Math.abs(value),
+          label: `A${i}:${value.toFixed(2)}`
+        });
+      }
+    }
+
+    signals.sort((a, b) => b.strength - a.strength);
+    return signals;
+  }
+
+  function chooseCalibrationSignal(signals, step) {
+    if (!signals.length || !step) return null;
+
+    if (step.kind === "turn") {
+      const hat = signals.find(s => s.type === "hat" && s.turn === step.value);
+      if (hat) return { type: "hat", index: hat.index, name: hat.name };
+    }
+
+    if (step.kind === "move") {
+      const hat = signals.find(s => s.type === "hat" && s.move === step.value);
+      if (hat) return { type: "hat", index: hat.index, name: hat.name };
+    }
+
+    const button = signals.find(s => s.type === "button");
+    if (button) return { type: "button", index: button.index };
+
+    const axis = signals.find(s => s.type === "axis");
+    if (axis) return { type: "axis", index: axis.index, sign: axis.sign };
+
+    const anyHat = signals.find(s => s.type === "hat");
+    if (anyHat) return { type: "hat", index: anyHat.index, name: anyHat.name };
+
+    return null;
+  }
+
+  function updateControllerCalibration(p) {
+    if (!calibration.active) return;
+
+    const now = performance.now();
+    const signals = getControllerSignals(p);
+    const step = calibrationSteps[calibration.step];
+
+    if (!step) {
+      calibration.active = false;
+      return;
+    }
+
+    const debug = signals.length ? signals.map(s => s.label).join(" ") : "idle";
+    if (debug !== lastPadDebug) {
+      padDebugTextEl.textContent = debug;
+      lastPadDebug = debug;
+    }
+
+    if (calibration.waitingForRelease) {
+      if (signals.length === 0 && now - calibration.lastRecordedAt > 250) {
+        calibration.waitingForRelease = false;
+        showCalibrationPrompt(`Now press ${step.label}.`);
+      }
+      return;
+    }
+
+    const binding = chooseCalibrationSignal(signals, step);
+    if (!binding) return;
+
+    controllerMap[step.action] = binding;
+    calibration.step++;
+    calibration.waitingForRelease = true;
+    calibration.lastRecordedAt = now;
+
+    const next = calibrationSteps[calibration.step];
+    showToast(`${step.label}: ${bindingLabel(binding)}`, 0.7);
+
+    if (next) {
+      showCalibrationPrompt(`Saved ${step.label}. Release all buttons, then press ${next.label}.`);
+    } else {
+      finishControllerCalibration();
+      return;
+    }
+  }
+
+  function readCalibratedControls(p, fallback) {
+    if (!hasMovementMap()) return fallback;
+
+    const mappedMove = boolAxis(
+      signalIsActive(controllerMap.forward, p),
+      signalIsActive(controllerMap.back, p)
+    );
+    const mappedTurn = boolAxis(
+      signalIsActive(controllerMap.right, p),
+      signalIsActive(controllerMap.left, p)
+    );
+
+    const mappedStrafe = boolAxis(
+      signalIsActive(controllerMap.strafeRight, p),
+      signalIsActive(controllerMap.strafeLeft, p)
+    );
+
+    return {
+      ...fallback,
+      move: mappedMove,
+      turn: mappedTurn,
+      strafe: mappedStrafe,
+      shootHeld: controllerMap.shoot ? signalIsActive(controllerMap.shoot, p) : fallback.shootHeld,
+      openHeld: controllerMap.open ? signalIsActive(controllerMap.open, p) : fallback.openHeld,
+      debug: `${fallback.debug} MAP`
+    };
+  }
+
+
   function showIntro() {
-    messageTitle.textContent = "SeanFPS v0.8.1";
+    messageTitle.textContent = "SeanFPS v0.9.1";
     messageBody.textContent = "";
     for (const node of introMessageNodes) {
       messageBody.appendChild(node.cloneNode(true));
@@ -553,6 +861,24 @@
     }
   }
 
+  function togglePadDebug() {
+    showPadDebug = !showPadDebug;
+    padDebugLineEl.classList.toggle("visible", showPadDebug);
+    showToast(showPadDebug ? "Pad debug on" : "Pad debug off", 0.45);
+  }
+
+  calibrateToggle.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    startControllerCalibration();
+  });
+
+  debugToggle.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    togglePadDebug();
+  });
+
   restartBtn.addEventListener("click", (e) => {
     e.preventDefault();
     resetGame(true);
@@ -560,9 +886,13 @@
 
   window.addEventListener("keydown", (e) => {
     if (e.code === "Backquote" || e.code === "KeyG") {
-      showPadDebug = !showPadDebug;
-      padDebugLineEl.classList.toggle("visible", showPadDebug);
-      showToast(showPadDebug ? "Pad debug on" : "Pad debug off", 0.45);
+      togglePadDebug();
+      e.preventDefault();
+      return;
+    }
+
+    if (e.code === "KeyC") {
+      startControllerCalibration();
       e.preventDefault();
       return;
     }
@@ -639,10 +969,12 @@
 
   canvas.addEventListener("touchstart", (e) => {
     e.preventDefault();
+    if (calibration.active) return;
     if (gameOver || won) resetGame(true);
     else if (!started) startGame();
   }, { passive: false });
   canvas.addEventListener("mousedown", () => {
+    if (calibration.active) return;
     if (gameOver || won) resetGame(true);
     else if (!started) startGame();
   });
@@ -685,10 +1017,11 @@
     return Math.abs(value) > deadzone ? value : 0;
   }
 
-  function strongestAxis(axes, indices, deadzone = 0.25) {
+  function strongestAxis(axes, indices, deadzone = 0.25, exclude = new Set()) {
     let best = 0;
     let bestIndex = -1;
     for (const index of indices) {
+      if (exclude.has(index)) continue;
       const value = readAxis(axes, index, deadzone);
       if (Math.abs(value) > Math.abs(best)) {
         best = value;
@@ -698,22 +1031,20 @@
     return { value: best, index: bestIndex };
   }
 
-  function readHatAxis(value) {
-    // Hat switches often report one of these discrete values:
-    // -1 up, -0.714 up/right, -0.429 right, -0.143 down/right,
-    //  0.143 down, 0.429 down/left, 0.714 left, 1 up/left.
-    // Use tight matching so normal analog drift does not become movement.
-    if (value === undefined) return { move: 0, turn: 0 };
+  function decodeHatAxis(value) {
+    // 8BitDo Micro and some compact controllers expose the D-pad as a single
+    // discrete "hat" axis. Decode exact-ish hat values before analog-stick logic.
+    if (value === undefined) return null;
 
     const states = [
-      { v: -1.000, move:  1, turn:  0 },
-      { v: -0.714, move:  1, turn:  1 },
-      { v: -0.429, move:  0, turn:  1 },
-      { v: -0.143, move: -1, turn:  1 },
-      { v:  0.143, move: -1, turn:  0 },
-      { v:  0.429, move: -1, turn: -1 },
-      { v:  0.714, move:  0, turn: -1 },
-      { v:  1.000, move:  1, turn: -1 }
+      { v: -1.000, move:  1, turn:  0, name: "up" },
+      { v: -0.714, move:  1, turn:  1, name: "up-right" },
+      { v: -0.429, move:  0, turn:  1, name: "right" },
+      { v: -0.143, move: -1, turn:  1, name: "down-right" },
+      { v:  0.143, move: -1, turn:  0, name: "down" },
+      { v:  0.429, move: -1, turn: -1, name: "down-left" },
+      { v:  0.714, move:  0, turn: -1, name: "left" },
+      { v:  1.000, move:  1, turn: -1, name: "up-left" }
     ];
 
     let best = null;
@@ -726,7 +1057,21 @@
       }
     }
 
-    return bestDelta <= 0.025 ? { move: best.move, turn: best.turn } : { move: 0, turn: 0 };
+    return bestDelta <= 0.035 ? { ...best, delta: bestDelta } : null;
+  }
+
+  function findHatAxis(axes) {
+    // Do not assume the hat is axis 9. On some micro controllers/Safari mappings,
+    // the hat can appear as axis 0, which used to cause "right" to be read as "left".
+    let best = null;
+    for (let i = 0; i < axes.length; i++) {
+      const decoded = decodeHatAxis(axes[i]);
+      if (!decoded) continue;
+      if (!best || decoded.delta < best.decoded.delta) {
+        best = { index: i, decoded };
+      }
+    }
+    return best;
   }
 
   function pollGamepad() {
@@ -752,14 +1097,10 @@
     const axes = p.axes || [];
     const pressed = (i) => !!(b[i] && b[i].pressed);
 
-    // Keep turn/move axes separate from strafe axes. This avoids a single compact-controller
-    // axis being read as both turn and strafe.
-    const h = strongestAxis(axes, [0, 4], 0.28);
-    const v = strongestAxis(axes, [1, 5], 0.28);
-
-    let turn = h.value;
-    let move = -v.value;
+    let turn = 0;
+    let move = 0;
     let strafe = 0;
+    const excludeAxes = new Set();
 
     // Standard D-pad buttons.
     const dpadActive = pressed(12) || pressed(13) || pressed(14) || pressed(15);
@@ -768,26 +1109,24 @@
     if (pressed(14)) turn -= 1;
     if (pressed(15)) turn += 1;
 
-    // Hat-axis fallback. Only inspect likely hat indices, not every analog axis,
-    // to avoid stick drift being interpreted as a D-pad direction.
-    if (!dpadActive && Math.abs(turn) < 0.01 && Math.abs(move) < 0.01) {
-      const likelyHatIndices = [];
-      for (let i = 8; i < axes.length; i++) likelyHatIndices.push(i);
-      if (axes.length > 3) likelyHatIndices.push(axes.length - 1);
-
-      for (const index of [...new Set(likelyHatIndices)]) {
-        const hat = readHatAxis(axes[index]);
-        if (hat.move || hat.turn) {
-          move += hat.move;
-          turn += hat.turn;
-          break;
-        }
-      }
+    // Hat-axis D-pad support first, before analog axis handling.
+    // This is the key fix for 8BitDo Micro-style mappings.
+    const hat = !dpadActive ? findHatAxis(axes) : null;
+    if (hat) {
+      move += hat.decoded.move;
+      turn += hat.decoded.turn;
+      excludeAxes.add(hat.index);
     }
 
-    // Shoulder buttons strafe on many controllers. Right stick X may also strafe,
-    // but these indices deliberately do not overlap with turn axes above.
-    const strafeAxis = strongestAxis(axes, [2, 6], 0.35);
+    // Analog/virtual-stick fallback. Keep turn/move axes separate from strafe axes.
+    const h = strongestAxis(axes, [0, 4], 0.28, excludeAxes);
+    const v = strongestAxis(axes, [1, 5], 0.28, excludeAxes);
+    turn += h.value;
+    move += -v.value;
+
+    // Shoulder buttons strafe. Right stick X may also strafe, but these indices
+    // deliberately do not overlap with turn axes above.
+    const strafeAxis = strongestAxis(axes, [2, 6], 0.35, excludeAxes);
     strafe += strafeAxis.value;
     if (pressed(4)) strafe -= 1;
     if (pressed(5)) strafe += 1;
@@ -801,13 +1140,23 @@
     }
     const activeAxes = [];
     for (let i = 0; i < axes.length; i++) {
-      if (Math.abs(axes[i] || 0) > 0.2) activeAxes.push(`${i}:${axes[i].toFixed(2)}`);
+      if (Math.abs(axes[i] || 0) > 0.05) activeAxes.push(`${i}:${axes[i].toFixed(3)}`);
     }
     const debug = pressedButtons.length || activeAxes.length
-      ? `B[${pressedButtons.join(",") || "-"}] A[${activeAxes.join(" ") || "-"}]`
+      ? `B[${pressedButtons.join(",") || "-"}] A[${activeAxes.join(" ") || "-"}]${hat ? " H" + hat.index + ":" + hat.decoded.name : ""}`
       : "idle";
 
-    return {
+    if (calibration.active) {
+      updateControllerCalibration(p);
+      return {
+        connected: true,
+        move: 0, turn: 0, strafe: 0,
+        shootHeld: false, openHeld: false,
+        debug
+      };
+    }
+
+    const fallback = {
       connected: true,
       move: clamp(move, -1, 1),
       turn: clamp(turn, -1, 1),
@@ -815,6 +1164,8 @@
       shootHeld, openHeld,
       debug
     };
+
+    return readCalibratedControls(p, fallback);
   }
 
   function combineInput(gp) {
@@ -920,6 +1271,14 @@
   }
 
   function update(dt, gp) {
+    if (calibration.active) {
+      if (toastTimer > 0) {
+        toastTimer -= dt;
+        if (toastTimer <= 0) toast.style.opacity = "0";
+      }
+      return;
+    }
+
     if (!started || gameOver || won) {
       if (toastTimer > 0) {
         toastTimer -= dt;
