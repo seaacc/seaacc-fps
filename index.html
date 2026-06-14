@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-<title>SeanFPS v0.5</title>
+<title>SeanFPS v0.8.1</title>
 <style>
   :root {
     --panel: rgba(0,0,0,.45);
@@ -27,6 +27,7 @@
     height: 100vh;
     display: block;
     background: #000;
+    image-rendering: crisp-edges;
     image-rendering: pixelated;
   }
   #hud {
@@ -75,6 +76,12 @@
   }
   #status div {
     white-space: nowrap;
+  }
+  #padDebugLine {
+    display: none;
+  }
+  #padDebugLine.visible {
+    display: block;
   }
   #toast {
     position: fixed;
@@ -241,15 +248,16 @@
     <div>Enemies <span id="enemyCount">0</span></div>
     <div>Ammo <span id="ammoText">0/0</span></div>
     <div>Controller: <span id="controllerText">press a button</span></div>
+    <div id="padDebugLine">Pad: <span id="padDebugText">none</span></div>
   </div>
 </div>
 
 <div id="toast"></div>
 
 <div id="message">
-  <h1 id="messageTitle">SeanFPS v0.5</h1>
+  <h1 id="messageTitle">SeanFPS v0.8.1</h1>
   <div id="messageBody">
-    <p><b>Goal:</b> destroy all red enemies.</p>
+    <p><b>Goal:</b> destroy all zombies.</p>
     <p><b>iPhone:</b> use touch buttons or a Bluetooth controller. Tap once to start.</p>
     <p><b>Controller:</b> D-pad/left stick moves/turns. A = shoot. B = open/use. Shoulder buttons may strafe.</p>
     <p><b>Keyboard:</b> WASD/Arrows, Q/E strafe, Space = shoot, F/Z = open.</p>
@@ -286,6 +294,8 @@
   const enemyCountEl = document.getElementById("enemyCount");
   const ammoTextEl = document.getElementById("ammoText");
   const controllerTextEl = document.getElementById("controllerText");
+  const padDebugLineEl = document.getElementById("padDebugLine");
+  const padDebugTextEl = document.getElementById("padDebugText");
   const hpFill = document.getElementById("hpFill");
   const ammoFill = document.getElementById("ammoFill");
   const toast = document.getElementById("toast");
@@ -295,14 +305,16 @@
   const restartBtn = document.getElementById("restartBtn");
   const introMessageNodes = Array.from(messageBody.childNodes).map(node => node.cloneNode(true));
 
-  const renderW = 360;
-  const renderH = 220;
+  const renderW = 480;
+  const renderH = 270;
   const maxAmmo = 28;
 
   const screen = document.createElement("canvas");
   screen.width = renderW;
   screen.height = renderH;
   const g = screen.getContext("2d", { alpha: false });
+  g.imageSmoothingEnabled = false;
+  g.webkitImageSmoothingEnabled = false;
 
   const skyGrad = g.createLinearGradient(0, 0, 0, renderH/2);
   skyGrad.addColorStop(0, "#202233");
@@ -453,6 +465,8 @@
   let lastAmmo = -1;
   let lastAlive = -1;
   let lastControllerLabel = "";
+  let lastPadDebug = "";
+  let showPadDebug = false;
 
   function initAudio() {
     if (!audioCtx) {
@@ -497,7 +511,7 @@
   }
 
   function showIntro() {
-    messageTitle.textContent = "SeanFPS v0.5";
+    messageTitle.textContent = "SeanFPS v0.8.1";
     messageBody.textContent = "";
     for (const node of introMessageNodes) {
       messageBody.appendChild(node.cloneNode(true));
@@ -545,6 +559,14 @@
   });
 
   window.addEventListener("keydown", (e) => {
+    if (e.code === "Backquote" || e.code === "KeyG") {
+      showPadDebug = !showPadDebug;
+      padDebugLineEl.classList.toggle("visible", showPadDebug);
+      showToast(showPadDebug ? "Pad debug on" : "Pad debug off", 0.45);
+      e.preventDefault();
+      return;
+    }
+
     if ((gameOver || won) && (e.code === "Enter" || e.code === "Space" || e.code === "KeyR")) {
       e.preventDefault();
       resetGame(true);
@@ -642,7 +664,7 @@
     started = true;
     initAudio();
     message.style.display = "none";
-    showToast("Find the red enemies", 0.8);
+    showToast("Find the zombies", 0.8);
   }
 
   function readKeyboardInput() {
@@ -658,6 +680,55 @@
     };
   }
 
+  function readAxis(axes, index, deadzone = 0.25) {
+    const value = axes[index] || 0;
+    return Math.abs(value) > deadzone ? value : 0;
+  }
+
+  function strongestAxis(axes, indices, deadzone = 0.25) {
+    let best = 0;
+    let bestIndex = -1;
+    for (const index of indices) {
+      const value = readAxis(axes, index, deadzone);
+      if (Math.abs(value) > Math.abs(best)) {
+        best = value;
+        bestIndex = index;
+      }
+    }
+    return { value: best, index: bestIndex };
+  }
+
+  function readHatAxis(value) {
+    // Hat switches often report one of these discrete values:
+    // -1 up, -0.714 up/right, -0.429 right, -0.143 down/right,
+    //  0.143 down, 0.429 down/left, 0.714 left, 1 up/left.
+    // Use tight matching so normal analog drift does not become movement.
+    if (value === undefined) return { move: 0, turn: 0 };
+
+    const states = [
+      { v: -1.000, move:  1, turn:  0 },
+      { v: -0.714, move:  1, turn:  1 },
+      { v: -0.429, move:  0, turn:  1 },
+      { v: -0.143, move: -1, turn:  1 },
+      { v:  0.143, move: -1, turn:  0 },
+      { v:  0.429, move: -1, turn: -1 },
+      { v:  0.714, move:  0, turn: -1 },
+      { v:  1.000, move:  1, turn: -1 }
+    ];
+
+    let best = null;
+    let bestDelta = Infinity;
+    for (const state of states) {
+      const delta = Math.abs(value - state.v);
+      if (delta < bestDelta) {
+        best = state;
+        bestDelta = delta;
+      }
+    }
+
+    return bestDelta <= 0.025 ? { move: best.move, turn: best.turn } : { move: 0, turn: 0 };
+  }
+
   function pollGamepad() {
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     let p = null;
@@ -667,7 +738,8 @@
       return {
         connected: !!lastKnownControllerName,
         move: 0, turn: 0, strafe: 0,
-        shootHeld: false, openHeld: false
+        shootHeld: false, openHeld: false,
+        debug: "none"
       };
     }
 
@@ -679,29 +751,69 @@
     const b = p.buttons || [];
     const axes = p.axes || [];
     const pressed = (i) => !!(b[i] && b[i].pressed);
-    const axis = (i) => Math.abs(axes[i] || 0) > 0.25 ? axes[i] : 0;
 
-    let move = -axis(1);
-    let turn = axis(0);
+    // Keep turn/move axes separate from strafe axes. This avoids a single compact-controller
+    // axis being read as both turn and strafe.
+    const h = strongestAxis(axes, [0, 4], 0.28);
+    const v = strongestAxis(axes, [1, 5], 0.28);
 
+    let turn = h.value;
+    let move = -v.value;
+    let strafe = 0;
+
+    // Standard D-pad buttons.
+    const dpadActive = pressed(12) || pressed(13) || pressed(14) || pressed(15);
     if (pressed(12)) move += 1;
     if (pressed(13)) move -= 1;
     if (pressed(14)) turn -= 1;
     if (pressed(15)) turn += 1;
 
-    let strafe = axis(2);
+    // Hat-axis fallback. Only inspect likely hat indices, not every analog axis,
+    // to avoid stick drift being interpreted as a D-pad direction.
+    if (!dpadActive && Math.abs(turn) < 0.01 && Math.abs(move) < 0.01) {
+      const likelyHatIndices = [];
+      for (let i = 8; i < axes.length; i++) likelyHatIndices.push(i);
+      if (axes.length > 3) likelyHatIndices.push(axes.length - 1);
+
+      for (const index of [...new Set(likelyHatIndices)]) {
+        const hat = readHatAxis(axes[index]);
+        if (hat.move || hat.turn) {
+          move += hat.move;
+          turn += hat.turn;
+          break;
+        }
+      }
+    }
+
+    // Shoulder buttons strafe on many controllers. Right stick X may also strafe,
+    // but these indices deliberately do not overlap with turn axes above.
+    const strafeAxis = strongestAxis(axes, [2, 6], 0.35);
+    strafe += strafeAxis.value;
     if (pressed(4)) strafe -= 1;
     if (pressed(5)) strafe += 1;
 
     const shootHeld = pressed(0) || pressed(2) || pressed(7);
     const openHeld = pressed(1) || pressed(3) || pressed(6);
 
+    const pressedButtons = [];
+    for (let i = 0; i < b.length; i++) {
+      if (pressed(i)) pressedButtons.push(i);
+    }
+    const activeAxes = [];
+    for (let i = 0; i < axes.length; i++) {
+      if (Math.abs(axes[i] || 0) > 0.2) activeAxes.push(`${i}:${axes[i].toFixed(2)}`);
+    }
+    const debug = pressedButtons.length || activeAxes.length
+      ? `B[${pressedButtons.join(",") || "-"}] A[${activeAxes.join(" ") || "-"}]`
+      : "idle";
+
     return {
       connected: true,
       move: clamp(move, -1, 1),
       turn: clamp(turn, -1, 1),
       strafe: clamp(strafe, -1, 1),
-      shootHeld, openHeld
+      shootHeld, openHeld,
+      debug
     };
   }
 
@@ -792,7 +904,7 @@
       won = true;
       beep(300, 0.08, "triangle", 0.04);
       setTimeout(() => beep(450, 0.08, "triangle", 0.04), 90);
-      setMessage("Clear!", ["You destroyed all red enemies.", "Press Restart, tap the screen, or press R / Enter / Space to play again."], true);
+      setMessage("Clear!", ["You destroyed all zombies.", "Press Restart, tap the screen, or press R / Enter / Space to play again."], true);
     }
   }
 
@@ -979,19 +1091,104 @@
   }
 
   function renderEnemies() {
-    for (const e of enemies) e._dist = Math.hypot(e.x - player.x, e.y - player.y);
     enemies.sort((a,b) => b._dist - a._dist);
 
     const fov = Math.PI / 3.2;
     for (const e of enemies) {
       if (!e.alive) continue;
-      renderBillboard(e.x, e.y, e._dist, fov, (x, yTop, yBot, dist) => {
-        g.fillStyle = dist < 1.2 ? "#ff443e" : "#b91f24";
-        g.fillRect(x, yTop, 1, yBot-yTop);
+      renderBillboard(e.x, e.y, e._dist, fov, (x, yTop, yBot, dist, size, rel) => {
+        const h = yBot - yTop;
+        if (h <= 1) return;
 
-        if (x % 5 === 0) {
-          g.fillStyle = "rgba(255,255,255,.18)";
-          g.fillRect(x, yTop+4, 1, Math.max(0, yBot-yTop-8));
+        // Basic retro zombie sprite built column-by-column.
+        // Sections: head, torso, arms, legs.
+        const headTop = Math.floor(yTop + h * 0.06);
+        const headBot = Math.floor(yTop + h * 0.28);
+        const torsoTop = headBot;
+        const torsoBot = Math.floor(yTop + h * 0.68);
+        const legsTop = torsoBot;
+        const legsBot = yBot;
+
+        const skin = dist < 1.2 ? "#98d48b" : "#7ebd70";
+        const darkSkin = dist < 1.2 ? "#78b56c" : "#65985a";
+        const eye = "#20130f";
+        const shirt = dist < 1.2 ? "#55626f" : "#414c57";
+        const pants = dist < 1.2 ? "#5a4737" : "#47382c";
+        const blood = dist < 1.2 ? "#8f1b1b" : "#6d1414";
+
+        // Head
+        if (headBot > headTop) {
+          g.fillStyle = skin;
+          g.fillRect(x, headTop, 1, Math.max(1, headBot - headTop));
+
+          // Darker edge shading
+          if (Math.abs(rel) > 0.18) {
+            g.fillStyle = darkSkin;
+            g.fillRect(x, headTop, 1, Math.max(1, headBot - headTop));
+          }
+
+          // Eyes: two dark bands near center columns
+          if (Math.abs(rel) < 0.11) {
+            const eyeY = Math.floor(headTop + (headBot - headTop) * 0.42);
+            g.fillStyle = eye;
+            g.fillRect(x, eyeY, 1, Math.max(1, Math.floor(h * 0.035)));
+          }
+        }
+
+        // Neck seam / blood hint
+        if (torsoTop > headTop) {
+          g.fillStyle = blood;
+          g.fillRect(x, torsoTop, 1, Math.max(1, Math.floor(h * 0.02)));
+        }
+
+        // Torso
+        if (torsoBot > torsoTop) {
+          g.fillStyle = shirt;
+          g.fillRect(x, torsoTop, 1, Math.max(1, torsoBot - torsoTop));
+
+          // Shirt shading near edges
+          if (Math.abs(rel) > 0.24) {
+            g.fillStyle = "#303942";
+            g.fillRect(x, torsoTop, 1, Math.max(1, torsoBot - torsoTop));
+          }
+
+          // Simple torn/bloody chest spot near center
+          if (Math.abs(rel) < 0.06) {
+            g.fillStyle = blood;
+            const by = Math.floor(torsoTop + (torsoBot - torsoTop) * 0.45);
+            g.fillRect(x, by, 1, Math.max(1, Math.floor(h * 0.06)));
+          }
+        }
+
+        // Arms: only on outer columns of torso band
+        if (Math.abs(rel) > 0.22 && Math.abs(rel) < 0.34) {
+          g.fillStyle = darkSkin;
+          const armTop = Math.floor(torsoTop + h * 0.05);
+          const armBot = Math.floor(torsoTop + h * 0.26);
+          g.fillRect(x, armTop, 1, Math.max(1, armBot - armTop));
+        }
+
+        // Legs
+        if (legsBot > legsTop) {
+          g.fillStyle = pants;
+          g.fillRect(x, legsTop, 1, Math.max(1, legsBot - legsTop));
+
+          // Split legs a little around the centre
+          if (Math.abs(rel) < 0.04) {
+            g.fillStyle = "rgba(0,0,0,0.35)";
+            g.fillRect(x, legsTop, 1, Math.max(1, legsBot - legsTop));
+          }
+
+          // Boots on lower area
+          const bootTop = Math.floor(legsTop + (legsBot - legsTop) * 0.75);
+          g.fillStyle = "#1b1615";
+          g.fillRect(x, bootTop, 1, Math.max(1, legsBot - bootTop));
+        }
+
+        // Occasional highlight stripe for retro readability
+        if (x % 6 === 0) {
+          g.fillStyle = "rgba(255,255,255,.08)";
+          g.fillRect(x, yTop, 1, Math.max(1, yBot - yTop));
         }
       });
     }
@@ -1004,7 +1201,7 @@
     while (ang > Math.PI) ang -= Math.PI*2;
     if (Math.abs(ang) > fov/2 + 0.25) return;
 
-    const size = Math.min(120, Math.max(8, renderH / dist * 0.78));
+    const size = Math.min(renderH * 0.85, Math.max(8, renderH / dist * 0.78));
     const sx = renderW/2 + (ang / (fov/2)) * (renderW/2) - size/2;
     const sy = renderH/2 - size*0.45;
     const x0 = Math.floor(sx), x1 = Math.floor(sx + size);
@@ -1018,7 +1215,7 @@
       const colH = size * body;
       const yTop = Math.floor(sy + size*0.5 - colH*0.5);
       const yBot = Math.floor(sy + size*0.5 + colH*0.5);
-      drawColumn(x, yTop, yBot, dist, size);
+      drawColumn(x, yTop, yBot, dist, size, rel);
     }
   }
 
@@ -1117,6 +1314,7 @@
 
   function drawToCanvas() {
     ctx.imageSmoothingEnabled = false;
+    ctx.webkitImageSmoothingEnabled = false;
     const scale = Math.max(W / renderW, H / renderH);
     const sw = renderW * scale, sh = renderH * scale;
     ctx.drawImage(screen, (W-sw)/2, (H-sh)/2, sw, sh);
@@ -1156,6 +1354,10 @@
     }
 
     // Controller label updates are event-driven, with a one-time poll fallback.
+    if (showPadDebug && gp.debug !== lastPadDebug) {
+      padDebugTextEl.textContent = gp.debug;
+      lastPadDebug = gp.debug;
+    }
   }
 
   function loop(t) {
